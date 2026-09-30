@@ -56,6 +56,3 @@ idf.py -p COMx flash monitor
 
 首次配置目标芯片时执行 `set-target`；将 `COMx` 替换成开发板串口。构建产物为 `build/E-Paper.bin`。三色全刷约需 20 秒；首次成功校时、日期变化以及每小时会刷新日历。
 
-## 上传 GitHub 前
-
-Wi-Fi 密码目前仍以常量保存在 `main/spi_master_example_main.c`。上传到公开仓库前，请先移除或改为本地私密配置，避免把家庭网络凭据发布到 GitHub。固件中的无认证 HTTP 后台也不要暴露到公网。
