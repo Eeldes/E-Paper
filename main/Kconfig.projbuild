@@ -1,0 +1,12 @@
+menu "GDEY042Z98 e-paper configuration"
+
+    config EPD_BUSY_GPIO
+        int "BUSY signal GPIO (-1 if not connected)"
+        range -1 48
+        default 47
+        help
+            Connect this to the panel BUSY signal when available. The SSD1683
+            drives BUSY high during reset and refresh. If left at -1, the
+            firmware uses a conservative fixed delay after a full refresh.
+
+endmenu
