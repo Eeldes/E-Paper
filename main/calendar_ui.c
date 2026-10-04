@@ -369,13 +369,14 @@ esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent)
     year[2] = (char)('0' + (year_number / 10) % 10);
     year[3] = (char)('0' + year_number % 10);
     year[4] = '\0';
-    draw_text(year, 13, 8, 8, INK_RED);
+    draw_text(year, 13, 8, 12, INK_RED);
     draw_battery(battery_percent);
     for (int col = 0; col < 7; ++col) {
-        const int width = text_width(weekdays[col], 4);
         const int cell_left = GRID_X + col * GRID_W / 7;
         const int cell_width = GRID_X + (col + 1) * GRID_W / 7 - cell_left;
-        draw_text(weekdays[col], cell_left + (cell_width - width) / 2, 39, 4, INK_RED);
+        const int width = text_width(weekdays[col], 6);
+        const ink_t ink = col >= 5 ? INK_RED : INK_BLACK;
+        draw_text(weekdays[col], cell_left + (cell_width - width) / 2, 38, 6, ink);
     }
     hline(GRID_X, 53, GRID_W, INK_BLACK);
 
@@ -405,7 +406,7 @@ esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent)
         } else {
             two_digits(number, day);
         }
-        const int width = text_width(number, 2);
+        const int width = text_width(number, 8);
         const int cell_left = GRID_X + col * GRID_W / 7;
         const int cell_width = GRID_X + (col + 1) * GRID_W / 7 - cell_left;
         const int cx = cell_left + cell_width / 2;
