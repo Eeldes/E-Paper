@@ -1,4 +1,3 @@
-#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,13 +17,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
-#include "lwip/inet.h"
-#include "lwip/sockets.h"
 #include "nvs_flash.h"
 
 #define WIFI_SSID "eiiman"
 #define WIFI_PASSWORD "12345678"
-#define HTTP_PORT 80
 #define BATTERY_GPIO 7
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_6 /* ESP32-S3 GPIO7 = ADC1_CH6 */
 
@@ -42,8 +38,6 @@ static adc_cali_handle_t s_adc_cali;
 static bool s_adc_calibrated;
 static bool s_sntp_started;
 static int s_battery_percent = -1;
-static char s_ip_address[16] = "0.0.0.0";
-static portMUX_TYPE s_network_info_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -52,19 +46,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ESP_ERROR_CHECK(esp_wifi_connect());
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_events, WIFI_HAS_IP);
-        portENTER_CRITICAL(&s_network_info_lock);
-        strlcpy(s_ip_address, "0.0.0.0", sizeof(s_ip_address));
-        portEXIT_CRITICAL(&s_network_info_lock);
         ESP_LOGW(TAG, "Wi-Fi disconnected; reconnecting");
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Connected to %s, IP=" IPSTR, WIFI_SSID, IP2STR(&event->ip_info.ip));
-        char ip_text[16];
-        snprintf(ip_text, sizeof(ip_text), IPSTR, IP2STR(&event->ip_info.ip));
-        portENTER_CRITICAL(&s_network_info_lock);
-        strlcpy(s_ip_address, ip_text, sizeof(s_ip_address));
-        portEXIT_CRITICAL(&s_network_info_lock);
         xEventGroupSetBits(s_wifi_events, WIFI_HAS_IP);
     }
 }
@@ -173,104 +159,6 @@ static bool get_local_time(struct tm *local_time)
     return localtime_r(&now, local_time) != NULL;
 }
 
-static bool send_all(int socket_fd, const char *data, size_t length)
-{
-    while (length > 0) {
-        const int sent = send(socket_fd, data, length, 0);
-        if (sent <= 0) return false;
-        data += sent;
-        length -= (size_t)sent;
-    }
-    return true;
-}
-
-static void http_reply(int socket_fd, int status, const char *content_type, const char *body)
-{
-    char header[192];
-    const char *reason = status == 200 ? "OK" : (status == 404 ? "Not Found" : "Service Unavailable");
-    const int header_len = snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %u\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-        status, reason, content_type, (unsigned)strlen(body));
-    if (header_len > 0 && (size_t)header_len < sizeof(header)) {
-        send_all(socket_fd, header, (size_t)header_len);
-        send_all(socket_fd, body, strlen(body));
-    }
-}
-
-static void handle_http_client(int socket_fd)
-{
-    struct timeval timeout = {.tv_sec = 2, .tv_usec = 0};
-    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    char request[768] = {0};
-    size_t used = 0;
-    while (used < sizeof(request) - 1) {
-        const int received = recv(socket_fd, request + used, sizeof(request) - 1 - used, 0);
-        if (received <= 0) break;
-        used += (size_t)received;
-        request[used] = '\0';
-        if (strstr(request, "\r\n\r\n") != NULL) break;
-    }
-
-    if (strncmp(request, "GET /status ", 12) == 0) {
-        struct tm now_tm;
-        char time_text[32] = "unsynchronized";
-        char ip_text[16];
-        portENTER_CRITICAL(&s_network_info_lock);
-        strlcpy(ip_text, s_ip_address, sizeof(ip_text));
-        portEXIT_CRITICAL(&s_network_info_lock);
-        if (get_local_time(&now_tm)) strftime(time_text, sizeof(time_text), "%Y-%m-%d %H:%M:%S", &now_tm);
-        char body[320];
-        snprintf(body, sizeof(body),
-                 "{\"ssid\":\"%s\",\"wifi\":%s,\"ip\":\"%s\",\"time\":\"%s\",\"battery_percent\":%d,\"adc_gpio\":%d}\n",
-                 WIFI_SSID, (xEventGroupGetBits(s_wifi_events) & WIFI_HAS_IP) ? "true" : "false",
-                 ip_text, time_text, s_battery_percent, BATTERY_GPIO);
-        http_reply(socket_fd, 200, "application/json; charset=utf-8", body);
-    } else if (strncmp(request, "GET / ", 6) == 0 || strncmp(request, "GET /index.html ", 16) == 0) {
-        static const char page[] =
-            "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-            "<title>ESP32 Calendar</title><style>body{font:18px system-ui;max-width:620px;margin:3em auto;padding:0 1em;color:#222}"
-            "h1{color:#b22}pre{background:#f3f3f3;padding:1em;border-radius:8px}</style></head>"
-            "<body><h1>E-Paper Calendar</h1><p>ESP32-S3 display backend</p><pre id=s>Loading...</pre>"
-            "<script>const s=document.getElementById('s');async function u(){try{let r=await fetch('/status'),j=await r.json();"
-            "s.textContent=JSON.stringify(j,null,2)}catch(e){s.textContent=e}}u();setInterval(u,10000)</script></body></html>";
-        http_reply(socket_fd, 200, "text/html; charset=utf-8", page);
-    } else {
-        http_reply(socket_fd, 404, "text/plain; charset=utf-8", "Try / or /status\n");
-    }
-}
-
-static void tcp_http_server_task(void *arg)
-{
-    (void)arg;
-    const int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (listen_fd < 0) {
-        ESP_LOGE(TAG, "TCP socket create failed: errno=%d", errno);
-        vTaskDelete(NULL);
-        return;
-    }
-    const int reuse = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    const struct sockaddr_in address = {
-        .sin_family = AF_INET,
-        .sin_port = htons(HTTP_PORT),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-    if (bind(listen_fd, (const struct sockaddr *)&address, sizeof(address)) != 0 || listen(listen_fd, 4) != 0) {
-        ESP_LOGE(TAG, "TCP server bind/listen failed: errno=%d", errno);
-        close(listen_fd);
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG, "HTTP-over-TCP backend listening on port %d (/ and /status)", HTTP_PORT);
-    while (true) {
-        const int client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0) continue;
-        handle_http_client(client_fd);
-        shutdown(client_fd, SHUT_RDWR);
-        close(client_fd);
-    }
-}
-
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting Wi-Fi calendar and GDEY042Z98 display");
@@ -284,7 +172,6 @@ void app_main(void)
     s_wifi_events = xEventGroupCreate();
     ESP_ERROR_CHECK(s_wifi_events ? ESP_OK : ESP_ERR_NO_MEM);
     wifi_start();
-    xTaskCreate(tcp_http_server_task, "calendar_http", 6144, NULL, 4, NULL);
 
     if (xEventGroupWaitBits(s_wifi_events, WIFI_HAS_IP, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000)) & WIFI_HAS_IP) {
         sntp_start();
@@ -294,7 +181,7 @@ void app_main(void)
             ESP_LOGW(TAG, "Time sync is pending; will keep waiting while Wi-Fi retries");
         }
     } else {
-        ESP_LOGW(TAG, "No Wi-Fi IP yet; server is ready and station will keep reconnecting");
+        ESP_LOGW(TAG, "No Wi-Fi connection yet; station will keep reconnecting");
     }
 
     bool calendar_drawn = false;
@@ -311,12 +198,7 @@ void app_main(void)
             const bool date_changed = now_tm.tm_mday != drawn_day || now_tm.tm_mon != drawn_month;
             const bool hourly_refresh = calendar_drawn && now - last_draw >= 3600;
             if (!calendar_drawn || date_changed || hourly_refresh) {
-                char ip_text[16];
-                portENTER_CRITICAL(&s_network_info_lock);
-                strlcpy(ip_text, s_ip_address, sizeof(ip_text));
-                portEXIT_CRITICAL(&s_network_info_lock);
-                const esp_err_t err = calendar_ui_render(&now_tm, s_battery_percent, ip_text,
-                    (xEventGroupGetBits(s_wifi_events) & WIFI_HAS_IP) != 0);
+                const esp_err_t err = calendar_ui_render(&now_tm, s_battery_percent);
                 if (err == ESP_OK) {
                     calendar_drawn = true;
                     drawn_day = now_tm.tm_mday;
