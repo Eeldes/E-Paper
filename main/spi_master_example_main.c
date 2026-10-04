@@ -13,7 +13,9 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
+#include "esp_sleep.h"
 #include "esp_wifi.h"
+#include "driver/rtc_io.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -23,6 +25,10 @@
 #define WIFI_PASSWORD "12345678"
 #define BATTERY_GPIO 7
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_6 /* ESP32-S3 GPIO7 = ADC1_CH6 */
+
+/* Change these settings to adjust the deep-sleep schedule and wake button. */
+#define DEEP_SLEEP_INTERVAL_HOURS 12
+#define WAKE_BUTTON_GPIO GPIO_NUM_4 /* Active-low button from GPIO4 to GND; RTC-capable on ESP32-S3. */
 
 /* The battery input is assumed to be a 1-cell Li-ion voltage behind a 1:2
  * divider. Change this to the actual board divider ratio for meaningful %. */
@@ -152,6 +158,33 @@ static int battery_read_percent(void)
     return (cell_mv - BATTERY_EMPTY_MV) * 100 / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
 }
 
+static void enter_deep_sleep(void)
+{
+    const uint64_t sleep_duration_us = (uint64_t)DEEP_SLEEP_INTERVAL_HOURS * 60ULL * 60ULL * 1000000ULL;
+
+    /* EXT0 uses an RTC GPIO and active-low level. Keep the internal pull-up on
+     * so the input remains high while the optional button is not pressed. */
+    ESP_ERROR_CHECK(rtc_gpio_init(WAKE_BUTTON_GPIO));
+    ESP_ERROR_CHECK(rtc_gpio_set_direction(WAKE_BUTTON_GPIO, RTC_GPIO_MODE_INPUT_ONLY));
+    ESP_ERROR_CHECK(rtc_gpio_pullup_en(WAKE_BUTTON_GPIO));
+    ESP_ERROR_CHECK(rtc_gpio_pulldown_dis(WAKE_BUTTON_GPIO));
+
+    /* Avoid immediately waking again if the button is still held as sleep begins. */
+    while (rtc_gpio_get_level(WAKE_BUTTON_GPIO) == 0) {
+        ESP_LOGI(TAG, "Release wake button on GPIO%d to enter deep sleep", WAKE_BUTTON_GPIO);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(sleep_duration_us));
+    ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(WAKE_BUTTON_GPIO, 0));
+
+    ESP_LOGI(TAG, "Entering deep sleep for %d hours; active-low wake button on GPIO%d",
+             DEEP_SLEEP_INTERVAL_HOURS, WAKE_BUTTON_GPIO);
+    /* Wi-Fi is not retained in deep sleep; stop it cleanly before sleeping. */
+    ESP_ERROR_CHECK(esp_wifi_stop());
+    esp_deep_sleep_start();
+}
+
 static bool get_local_time(struct tm *local_time)
 {
     const time_t now = time(NULL);
@@ -161,7 +194,14 @@ static bool get_local_time(struct tm *local_time)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting Wi-Fi calendar and GDEY042Z98 display");
+    const esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    if (wake_cause == ESP_SLEEP_WAKEUP_TIMER) {
+        ESP_LOGI(TAG, "Woke from 12-hour timer; refreshing network time");
+    } else if (wake_cause == ESP_SLEEP_WAKEUP_EXT0) {
+        ESP_LOGI(TAG, "Woke from button on GPIO%d; refreshing network time", WAKE_BUTTON_GPIO);
+    } else {
+        ESP_LOGI(TAG, "Power-on/reset; will sync time, refresh display, then sleep");
+    }
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(gdey042z98_init());
     battery_adc_init();
@@ -173,43 +213,43 @@ void app_main(void)
     ESP_ERROR_CHECK(s_wifi_events ? ESP_OK : ESP_ERR_NO_MEM);
     wifi_start();
 
-    if (xEventGroupWaitBits(s_wifi_events, WIFI_HAS_IP, pdFALSE, pdTRUE, pdMS_TO_TICKS(30000)) & WIFI_HAS_IP) {
-        sntp_start();
-        if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(20000)) == ESP_OK) {
-            ESP_LOGI(TAG, "Network time synchronized");
-        } else {
-            ESP_LOGW(TAG, "Time sync is pending; will keep waiting while Wi-Fi retries");
-        }
-    } else {
-        ESP_LOGW(TAG, "No Wi-Fi connection yet; station will keep reconnecting");
-    }
-
-    bool calendar_drawn = false;
-    int drawn_day = -1;
-    int drawn_month = -1;
-    time_t last_draw = 0;
+    ESP_LOGI(TAG, "Waiting for Wi-Fi and a successful SNTP sync before refreshing");
     while (true) {
-        if ((xEventGroupGetBits(s_wifi_events) & WIFI_HAS_IP) && !s_sntp_started) {
+        if (!(xEventGroupGetBits(s_wifi_events) & WIFI_HAS_IP)) {
+            xEventGroupWaitBits(s_wifi_events, WIFI_HAS_IP, pdFALSE, pdTRUE, pdMS_TO_TICKS(5000));
+            continue;
+        }
+        if (!s_sntp_started) {
             sntp_start();
         }
-        struct tm now_tm;
-        if (get_local_time(&now_tm)) {
-            const time_t now = time(NULL);
-            const bool date_changed = now_tm.tm_mday != drawn_day || now_tm.tm_mon != drawn_month;
-            const bool hourly_refresh = calendar_drawn && now - last_draw >= 3600;
-            if (!calendar_drawn || date_changed || hourly_refresh) {
-                const esp_err_t err = calendar_ui_render(&now_tm, s_battery_percent);
-                if (err == ESP_OK) {
-                    calendar_drawn = true;
-                    drawn_day = now_tm.tm_mday;
-                    drawn_month = now_tm.tm_mon;
-                    last_draw = now;
-                } else {
-                    ESP_LOGE(TAG, "Calendar refresh failed: %s", esp_err_to_name(err));
-                }
-            }
+        if (!s_sntp_started) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
         }
+
+        const esp_err_t sync_err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(5000));
+        if (sync_err != ESP_OK) {
+            ESP_LOGW(TAG, "SNTP not synchronized yet (%s); will retry", esp_err_to_name(sync_err));
+            continue;
+        }
+
+        struct tm now_tm;
+        if (!get_local_time(&now_tm)) {
+            ESP_LOGW(TAG, "System time is not valid after SNTP; will retry");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Network time synchronized; refreshing calendar");
         s_battery_percent = battery_read_percent();
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        const esp_err_t render_err = calendar_ui_render(&now_tm, s_battery_percent);
+        if (render_err != ESP_OK) {
+            ESP_LOGE(TAG, "Calendar refresh failed: %s; retrying", esp_err_to_name(render_err));
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Calendar refreshed; entering deep sleep");
+        enter_deep_sleep();
     }
 }
