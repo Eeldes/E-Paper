@@ -370,6 +370,21 @@ esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent)
     year[3] = (char)('0' + year_number % 10);
     year[4] = '\0';
     draw_text(year, 13, 8, 12, INK_RED);
+    char month_number[3];
+    const int month_value = local_time->tm_mon + 1;
+    if (month_value >= 10) {
+        month_number[0] = '1';
+        month_number[1] = (char)('0' + month_value - 10);
+        month_number[2] = '\0';
+    } else {
+        month_number[0] = (char)('0' + month_value);
+        month_number[1] = '\0';
+    }
+    const int year_unit_x = 13 + text_width(year, 12) + 2;
+    draw_chinese_text("年", year_unit_x, 8, 20, INK_RED);
+    const int month_x = year_unit_x + 22;
+    draw_text(month_number, month_x, 8, 12, INK_RED);
+    draw_chinese_text("月", month_x + text_width(month_number, 12) + 2, 8, 20, INK_RED);
     draw_battery(battery_percent);
     for (int col = 0; col < 7; ++col) {
         const int cell_left = GRID_X + col * GRID_W / 7;
