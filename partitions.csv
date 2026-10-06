@@ -1,0 +1,13 @@
+# Partition table for the ESP32-S3 N16R8 module (16 MB flash, 8 MB PSRAM).
+#
+# Layout note: the two application slots are 6 MB each, so a firmware image that
+# currently sits just under 1 MB has plenty of room for more glyphs and features,
+# and OTA updates stay possible later without changing the table again.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xf000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x600000,
+ota_1,      app,  ota_1,   0x620000, 0x600000,
+storage,    data, spiffs,  0xc20000, 0x3D0000,

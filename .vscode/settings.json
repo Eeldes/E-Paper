@@ -23,7 +23,7 @@
     "interface/ftdi/esp32_devkitj_v1.cfg",
     "target/esp32s3.cfg"
   ],
-  "idf.port": "COM4",
+  "idf.port": "COM6",
   "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.2/",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"

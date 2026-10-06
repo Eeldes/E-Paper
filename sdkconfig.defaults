@@ -1,0 +1,16 @@
+# Build defaults for this board: ESP32-S3 N16R8 (16 MB flash, 8 MB octal PSRAM).
+#
+# ESP-IDF applies this file the first time a build directory is configured, so a
+# fresh clone keeps the 16 MB flash size and the project's partition table
+# instead of falling back to the 2 MB / single-app defaults.
+#
+# sdkconfig itself is generated and gitignored; change settings with
+# `idf.py menuconfig` and copy anything that must persist back into this file.
+
+# 16 MB SPI flash on the module.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Project partition table (partitions.csv): two 6 MB app slots plus a data
+# partition, so the ~1 MB image is no longer close to the app partition limit.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

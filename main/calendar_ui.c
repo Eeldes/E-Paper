@@ -5,8 +5,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "gdey042z98.h"
 #include "chinese_font.h"
+#include "gdey042z98.h"
+#include "weather.h"
 
 #define WIDTH 400
 #define HEIGHT 300
@@ -16,7 +17,32 @@
 #define GRID_W 259
 #define GRID_Y 58
 #define CALENDAR_BOTTOM 286
-#define FONT_SCALE_DENOMINATOR 4
+
+/* ------------------------------------------------------------------------- *
+ * Text metrics
+ *
+ * The ASCII font is stored as 5x7 cells.  Every ASCII metric is expressed in
+ * quarter-pixels and multiplied by the caller's scale, so a glyph's size and
+ * its advance grow together; rounding happens once, when a pixel is set.
+ * Chinese glyphs come from a single 20x20 face and are always drawn at
+ * CHINESE_SIZE so every Chinese string on the panel has the same weight and
+ * line height.
+ * ------------------------------------------------------------------------- */
+#define SCALE_UNIT 4
+#define CHINESE_SIZE 20
+
+/* 5x7 cell metrics, in pixels at scale 4 (so every value scales as
+ * `value * scale / SCALE_UNIT`).  A cell advances 6 units while its glyph body
+ * is 5 units wide, leaving a small gap between neighbouring cells so stacked
+ * digits such as the year stay readable. */
+#define ASCII_ADVANCE_UNITS 6
+#define ASCII_GLYPH_UNITS 5
+#define ASCII_BODY_HEIGHT_UNITS 7
+
+/* ASCII scale (in quarter-pixels) for numbers and units drawn inside Chinese
+ * lines, and the smallest scale a line may shrink to in order to fit. */
+#define ASCII_VALUE_SCALE 8
+#define ASCII_SCALE_MIN 6
 
 typedef enum { INK_WHITE, INK_BLACK, INK_RED } ink_t;
 
@@ -85,11 +111,11 @@ static const uint8_t *glyph_for(char c)
     static const uint8_t colon[5] = {0x00,0x36,0x36,0x00,0x00};
     static const uint8_t percent[5] = {0x63,0x13,0x08,0x64,0x63};
     static const uint8_t period[5] = {0x00,0x00,0x01,0x00,0x00};
-    static const uint8_t hyphen[5] = {0x08,0x08,0x08,0x08,0x08};
+    static const uint8_t slash[5] = {0x20,0x10,0x08,0x04,0x02};
     if (c == ':') return colon;
     if (c == '%') return percent;
     if (c == '.') return period;
-    if (c == '-') return hyphen;
+    if (c == '/') return slash;
     return NULL;
 }
 
@@ -126,21 +152,74 @@ static void fill_rect(int x, int y, int width, int height, ink_t ink)
     for (int py = 0; py < height; ++py) hline(x, y + py, width, ink);
 }
 
-static int text_width(const char *text, int scale)
+/* --------------------------------------------------------------------------
+ * ASCII helpers
+ * ------------------------------------------------------------------------ */
+
+/* Advance between two 5x7 cells, for a cell of `scale` quarter-pixels. */
+static int ascii_advance(int scale)
 {
-    const int length = (int)strlen(text);
-    if (length == 0) return 0;
-    const int glyph_width = (5 * scale + FONT_SCALE_DENOMINATOR - 1) / FONT_SCALE_DENOMINATOR;
-    const int advance = (6 * scale + FONT_SCALE_DENOMINATOR / 2) / FONT_SCALE_DENOMINATOR;
-    return (length - 1) * advance + glyph_width;
+    return ASCII_ADVANCE_UNITS * scale / SCALE_UNIT;
 }
 
-static void two_digits(char out[3], int value)
+/* Drawn width of a 5x7 cell body at `scale` quarter-pixels; the remaining
+ * advance is the gap to the next cell. */
+static int ascii_glyph_width(int scale)
 {
-    out[0] = (char)('0' + (value / 10) % 10);
-    out[1] = (char)('0' + value % 10);
-    out[2] = '\0';
+    return ASCII_GLYPH_UNITS * scale / SCALE_UNIT;
 }
+
+/* Width of `text` in pixels for a 5x7 cell of `scale` quarter-pixels. */
+static int ascii_text_width(const char *text, int scale)
+{
+    const size_t length = strlen(text);
+    if (length == 0) return 0;
+    return (int)(length - 1) * ascii_advance(scale) + ascii_glyph_width(scale);
+}
+
+/* Draw one 5x7 cell of `scale` quarter-pixels with the cell top-left at
+ * (x, y).  The glyph body is painted with its baseline on the cell floor, so
+ * the ink of a digit or capital is 7 * scale / 4 pixels tall and every mixed
+ * line keeps one baseline. */
+static void draw_ascii_glyph(const uint8_t *glyph, int x, int y, int scale, ink_t ink)
+{
+    if (glyph == NULL) return;
+    for (int col = 0; col < 5; ++col) {
+        const int x0 = x + col * scale / SCALE_UNIT;
+        const int x1 = x + (col + 1) * scale / SCALE_UNIT;
+        for (int row = 0; row < 7; ++row) {
+            if (!((glyph[col] >> row) & 1U)) continue;
+            const int y0 = y + row * scale / SCALE_UNIT;
+            const int y1 = y + (row + 1) * scale / SCALE_UNIT;
+            for (int py = y0; py < y1; ++py)
+                for (int px = x0; px < x1; ++px)
+                    pixel(px, py, ink);
+        }
+    }
+}
+
+static void draw_text(const char *text, int x, int y, int scale, ink_t ink)
+{
+    const int advance = ascii_advance(scale);
+    for (; *text; ++text, x += advance) {
+        draw_ascii_glyph(glyph_for(*text), x, y, scale, ink);
+    }
+}
+
+/* Vertical centre of the ink produced by draw_text() at the same arguments. */
+static int ascii_center_y(int y, int scale)
+{
+    return y + ASCII_BODY_HEIGHT_UNITS * scale / (2 * SCALE_UNIT);
+}
+
+/* --------------------------------------------------------------------------
+ * Chinese helpers
+ *
+ * Chinese glyphs are 20x20 cells drawn at CHINESE_SIZE; ASCII taken from the
+ * 5x7 font is drawn at a caller-chosen scale.  Because the two advances differ,
+ * a mixed string such as "风6km/h" must be measured per character instead of
+ * one cell per character.
+ * ------------------------------------------------------------------------ */
 
 static const chinese_glyph_t *chinese_glyph(uint16_t codepoint)
 {
@@ -150,6 +229,7 @@ static const chinese_glyph_t *chinese_glyph(uint16_t codepoint)
     return NULL;
 }
 
+/* Convert the next UTF-8 codepoint and advance the cursor past it. */
 static uint16_t utf8_next_codepoint(const char **text)
 {
     const uint8_t *p = (const uint8_t *)*text;
@@ -166,35 +246,144 @@ static uint16_t utf8_next_codepoint(const char **text)
     return 0;
 }
 
-static void draw_chinese_text(const char *text, int x, int y, int size, ink_t ink)
+/* Horizontal offset of a glyph's ink inside its own cell. */
+static void chinese_glyph_ink_x(const chinese_glyph_t *glyph, int size, int *start, int *end)
+{
+    int first = size;
+    int last = -1;
+    for (int y = 0; y < 20; ++y) {
+        for (int x = 0; x < 20; ++x) {
+            if ((glyph->rows[y] >> (19 - x)) & 1U) {
+                if (x < first) first = x;
+                if (x > last) last = x;
+            }
+        }
+    }
+    if (last < 0) {
+        *start = 0;
+        *end = size;
+        return;
+    }
+    *start = first * size / 20;
+    *end = (last + 1) * size / 20;
+}
+
+/* Advance of one character at the current Chinese size and ASCII scale. */
+static int char_advance(uint16_t codepoint, int ascii_scale)
+{
+    return chinese_glyph(codepoint) != NULL ? CHINESE_SIZE : ascii_advance(ascii_scale);
+}
+
+/* Pen advance of a mixed string, in pixels. */
+static int mixed_text_width(const char *text, int ascii_scale)
+{
+    int width = 0;
+    const char *cursor = text;
+    while (cursor && *cursor) {
+        width += char_advance(utf8_next_codepoint(&cursor), ascii_scale);
+    }
+    return width;
+}
+
+/* Ink extent of a mixed string relative to the pen origin: [start, end).  The
+ * blank side bearings of the 20x20 cells are excluded so that a string is
+ * centred by what is actually visible, not by its advance width. */
+static void mixed_text_ink(const char *text, int ascii_scale, int *start, int *end)
+{
+    const char *cursor = text;
+    int pen = 0;
+    int first = -1;
+    int last = -1;
+    while (cursor && *cursor) {
+        const uint16_t codepoint = utf8_next_codepoint(&cursor);
+        const chinese_glyph_t *glyph = chinese_glyph(codepoint);
+        if (glyph != NULL) {
+            int ink_start = 0;
+            int ink_end = 0;
+            chinese_glyph_ink_x(glyph, CHINESE_SIZE, &ink_start, &ink_end);
+            if (ink_end > ink_start) {
+                if (first < 0) first = pen + ink_start;
+                last = pen + ink_end;
+            }
+            pen += CHINESE_SIZE;
+        } else {
+            const int advance = ascii_advance(ascii_scale);
+            const int body = ascii_glyph_width(ascii_scale);
+            if (glyph_for((char)codepoint) != NULL) {
+                if (first < 0) first = pen;
+                last = pen + body;
+            }
+            pen += advance;
+        }
+    }
+    if (last < 0) {
+        *start = 0;
+        *end = 0;
+        return;
+    }
+    *start = first;
+    *end = last;
+}
+
+static bool chinese_text_supported(const char *text)
+{
+    const char *cursor = text;
+    if (cursor == NULL || *cursor == '\0') return false;
+    while (*cursor) {
+        const uint16_t codepoint = utf8_next_codepoint(&cursor);
+        if (chinese_glyph(codepoint) == NULL) return false;
+    }
+    return true;
+}
+
+/* Draw every glyph that exists in the subset; unknown codepoints advance the
+ * pen without drawing, so a stray character cannot shift the rest of a line. */
+static void draw_mixed_text(const char *text, int x, int y, int ascii_scale, ink_t ink)
 {
     while (text && *text) {
-        const chinese_glyph_t *glyph = chinese_glyph(utf8_next_codepoint(&text));
-        if (glyph) {
-            for (int py = 0; py < size; ++py) {
-                const int source_y = py * 20 / size;
-                for (int px = 0; px < size; ++px) {
-                    const int source_x = px * 20 / size;
-                    if ((glyph->rows[source_y] >> (19 - source_x)) & 1U) {
+        const uint16_t codepoint = utf8_next_codepoint(&text);
+        const chinese_glyph_t *glyph = chinese_glyph(codepoint);
+        if (glyph != NULL) {
+            for (int py = 0; py < CHINESE_SIZE; ++py) {
+                for (int px = 0; px < CHINESE_SIZE; ++px) {
+                    if ((glyph->rows[py] >> (19 - px)) & 1U) {
                         pixel(x + px, y + py, ink);
                     }
                 }
             }
+        } else {
+            draw_ascii_glyph(glyph_for((char)codepoint), x, y, ascii_scale, ink);
         }
-        x += size;
+        x += char_advance(codepoint, ascii_scale);
     }
 }
 
-static void draw_chinese_centered(const char *text, int left, int width, int y, int size, ink_t ink)
+/* Draw a mixed string centred in [left, left + width) by its visible ink. */
+static void draw_mixed_centered(const char *text, int left, int width, int y, int ascii_scale, ink_t ink)
 {
-    const char *cursor = text;
-    int glyph_count = 0;
-    while (cursor && *cursor) {
-        (void)utf8_next_codepoint(&cursor);
-        ++glyph_count;
-    }
-    draw_chinese_text(text, left + (width - glyph_count * size) / 2, y, size, ink);
+    int ink_start = 0;
+    int ink_end = 0;
+    mixed_text_ink(text, ascii_scale, &ink_start, &ink_end);
+    const int visible = ink_end - ink_start;
+    draw_mixed_text(text, left + (width - visible) / 2 - ink_start, y, ascii_scale, ink);
 }
+
+/* Largest ASCII scale that keeps a mixed string inside `width`, never above
+ * `max_scale`.  Keeps numbers and units from being clipped by the panel. */
+static int mixed_fit_scale(const char *text, int width, int max_scale, int min_scale)
+{
+    for (int scale = max_scale; scale > min_scale; --scale) {
+        int ink_start = 0;
+        int ink_end = 0;
+        mixed_text_ink(text, scale, &ink_start, &ink_end);
+        if (ink_end - ink_start <= width) return scale;
+    }
+    return min_scale;
+}
+
+/* --------------------------------------------------------------------------
+ * Lunar calendar
+ * ------------------------------------------------------------------------ */
 
 static int64_t civil_day_number(int year, int month, int day)
 {
@@ -280,55 +469,130 @@ static void lunar_day_text(char *out, size_t out_size, int day)
     else snprintf(out, out_size, "廿%s", digits[day - 21]);
 }
 
-static void draw_today_almanac(const struct tm *local_time)
+/* --------------------------------------------------------------------------
+ * Panel sections
+ * ------------------------------------------------------------------------ */
+
+/* Right-hand column: today's lunar date, the local weather for
+ * WEATHER_PLACE_NAME, and the temperature/wind read from the service.
+ *
+ * The panel is split into groups (the lunar date and the weather report) so the
+ * two topics read as separate blocks: rows within a group are spaced a line
+ * apart, and ROW_GROUP_GAP separates the groups.  The whole block is centred
+ * vertically and horizontally inside the panel margins. */
+#define PANEL_LEFT 280
+#define PANEL_WIDTH 108
+#define PANEL_MARGIN_TOP 64
+#define PANEL_MARGIN_BOTTOM 276
+#define PANEL_ROW_STEP 26
+#define PANEL_GROUP_GAP 22
+
+static void draw_today_panel(const struct tm *local_time, const weather_info_t *weather)
 {
-    static const char *const stems[] = {"甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"};
-    static const char *const branches[] = {"子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"};
-    static const char *const animals[] = {"鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"};
+    vline(274, GRID_Y - 4, CALENDAR_BOTTOM - GRID_Y + 4, INK_BLACK);
+
     lunar_date_t lunar;
     if (!solar_to_lunar(local_time, &lunar)) return;
 
-    const int year_index = (lunar.year - 4) % 60;
-    const int day_index = (int)((civil_day_number(lunar.year ? local_time->tm_year + 1900 : 1900,
-        local_time->tm_mon + 1, local_time->tm_mday) - civil_day_number(1900, 1, 1) + 10) % 60);
-    char month_text[16], day_text[16], year_gz[16], day_gz[16];
+    char month_text[16];
     lunar_month_text(month_text, sizeof(month_text), &lunar);
+
+    char day_text[16];
     lunar_day_text(day_text, sizeof(day_text), lunar.day);
-    snprintf(year_gz, sizeof(year_gz), "%s%s年", stems[year_index % 10], branches[year_index % 12]);
-    snprintf(day_gz, sizeof(day_gz), "%s%s日", stems[day_index % 10], branches[day_index % 12]);
 
-    vline(274, GRID_Y - 4, CALENDAR_BOTTOM - GRID_Y + 4, INK_BLACK);
-    draw_chinese_centered("农历", 280, 108, 61, 20, INK_RED);
-    draw_chinese_centered(month_text, 280, 108, 83, 20, INK_BLACK);
-    draw_chinese_centered(day_text, 280, 108, 107, 26, INK_RED);
-    hline(280, 142, 108, INK_BLACK);
-    draw_chinese_centered("干支", 280, 108, 149, 20, INK_RED);
-    draw_chinese_centered(year_gz, 280, 108, 171, 20, INK_BLACK);
-    draw_chinese_centered(day_gz, 280, 108, 193, 20, INK_BLACK);
-    hline(280, 218, 108, INK_BLACK);
-    draw_chinese_centered("生肖", 280, 108, 223, 20, INK_RED);
-    draw_chinese_centered(animals[(lunar.year - 4) % 12], 280, 108, 246, 30, INK_BLACK);
-}
+    char condition[24] = {0};
+    char temperature[24] = {0};
+    char wind[24] = {0};
+    const char *name = NULL;
+    if (weather != NULL && weather->valid) {
+        snprintf(condition, sizeof(condition), "%s", weather_code_text(weather->weather_code));
+        snprintf(temperature, sizeof(temperature), "%d度", weather->temperature_c);
+        /* Chinese unit: the panel's 5x7 ASCII font has no lowercase letters. */
+        if (weather->has_wind) snprintf(wind, sizeof(wind), "风%d公里", weather->wind_kmh);
+        name = WEATHER_PLACE_NAME;
+    } else {
+        /* Compact fallback: the weather block would otherwise be one bare "--". */
+        strlcpy(condition, "无法获取", sizeof(condition));
+    }
 
-static void draw_text(const char *text, int x, int y, int scale, ink_t ink)
-{
-    const int advance = (6 * scale + FONT_SCALE_DENOMINATOR / 2) / FONT_SCALE_DENOMINATOR;
-    for (; *text; ++text, x += advance) {
-        const uint8_t *glyph = glyph_for(*text);
-        if (!glyph) continue;
-        for (int col = 0; col < 5; ++col) {
-            for (int row = 0; row < 7; ++row) {
-                if ((glyph[col] >> row) & 1U) {
-                    const int x0 = x + col * scale / FONT_SCALE_DENOMINATOR;
-                    const int x1 = x + (col + 1) * scale / FONT_SCALE_DENOMINATOR;
-                    const int y0 = y + row * scale / FONT_SCALE_DENOMINATOR;
-                    const int y1 = y + (row + 1) * scale / FONT_SCALE_DENOMINATOR;
-                    for (int py = y0; py < y1; ++py)
-                        for (int px = x0; px < x1; ++px)
-                            pixel(px, py, ink);
-                }
+    /* Only show the place name when the built-in font can draw every glyph
+     * in it; otherwise keep the lines that are guaranteed to render. */
+    if (name != NULL && !chinese_text_supported(name)) name = NULL;
+    if (name != NULL && mixed_text_width(name, ASCII_VALUE_SCALE) > PANEL_WIDTH) name = NULL;
+
+    /* Rows are (label, value, starts_new_group); a NULL label means the value
+     * carries the line on its own. */
+    enum { MAX_ROWS = 8 };
+    const char *labels[MAX_ROWS];
+    const char *values[MAX_ROWS];
+    bool group_start[MAX_ROWS];
+    int row_count = 0;
+
+    labels[row_count] = "农历";
+    values[row_count] = month_text;
+    group_start[row_count++] = true;
+    labels[row_count] = NULL;
+    values[row_count] = day_text;
+    group_start[row_count++] = false;
+
+    labels[row_count] = NULL;
+    values[row_count] = condition;
+    group_start[row_count++] = true;
+    if (name != NULL) {
+        labels[row_count] = NULL;
+        values[row_count] = name;
+        group_start[row_count++] = false;
+    }
+    if (temperature[0] != '\0') {
+        labels[row_count] = NULL;
+        values[row_count] = temperature;
+        group_start[row_count++] = false;
+    }
+    if (wind[0] != '\0') {
+        labels[row_count] = NULL;
+        values[row_count] = wind;
+        group_start[row_count++] = false;
+    }
+    if (row_count > MAX_ROWS) return;
+
+    /* Centre the block, then place each row, adding the group gap where a new
+     * group begins. */
+    const int block_height = (row_count - 1) * PANEL_ROW_STEP + CHINESE_SIZE + PANEL_GROUP_GAP;
+    int y = PANEL_MARGIN_TOP + ((PANEL_MARGIN_BOTTOM - PANEL_MARGIN_TOP + 1) - block_height) / 2;
+    for (int i = 0; i < row_count; ++i) {
+        if (i > 0 && group_start[i]) {
+            /* A hairline between the groups keeps the two topics apart without
+             * the empty middle looking accidental, the way the almanac panel
+             * used to be divided. */
+            hline(PANEL_LEFT + 8, y - 2, PANEL_WIDTH - 16, INK_BLACK);
+            y += PANEL_GROUP_GAP;
+        }
+        const char *label = labels[i];
+        const char *value = values[i];
+        /* The ASCII part (digits, units, signs) is sized per line so the text
+         * always fits the panel instead of being clipped. */
+        const int value_scale = mixed_fit_scale(value, PANEL_WIDTH, ASCII_VALUE_SCALE, ASCII_SCALE_MIN);
+        if (label != NULL) {
+            int label_start = 0;
+            int label_end = 0;
+            int value_start = 0;
+            int value_end = 0;
+            mixed_text_ink(label, ASCII_VALUE_SCALE, &label_start, &label_end);
+            mixed_text_ink(value, value_scale, &value_start, &value_end);
+            const int pair_width = (label_end - label_start) + (value_end - value_start);
+            /* A label is only shown when the pair fits; the data matters more. */
+            if (pair_width <= PANEL_WIDTH) {
+                const int x = PANEL_LEFT + (PANEL_WIDTH - pair_width) / 2;
+                /* Labels are red and sit one pixel high so the pair does not
+                 * look bottom-heavy. */
+                draw_mixed_text(label, x - label_start, y + 1, ASCII_VALUE_SCALE, INK_RED);
+                draw_mixed_text(value, x + (label_end - label_start) - value_start, y, value_scale, INK_BLACK);
+                y += PANEL_ROW_STEP;
+                continue;
             }
         }
+        draw_mixed_centered(value, PANEL_LEFT, PANEL_WIDTH, y, value_scale, INK_BLACK);
+        y += PANEL_ROW_STEP;
     }
 }
 
@@ -351,7 +615,8 @@ static void draw_battery(int percent)
     draw_text(label, 304, 16, 8, low ? INK_RED : INK_BLACK);
 }
 
-esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent)
+esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent,
+                             const weather_info_t *weather)
 {
     if (local_time == NULL) return ESP_ERR_INVALID_ARG;
     memset(s_black, 0xFF, sizeof(s_black));
@@ -363,13 +628,23 @@ esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent)
 
     const int year_number = local_time->tm_year + 1900;
     if (year_number < 0 || year_number > 9999) return ESP_ERR_INVALID_ARG;
+
+    /* Header: the Arabic year/month digits and the Chinese 年/月 units share a
+     * vertical centre so nothing sits higher than its neighbour. */
     char year[5];
     year[0] = (char)('0' + (year_number / 1000) % 10);
     year[1] = (char)('0' + (year_number / 100) % 10);
     year[2] = (char)('0' + (year_number / 10) % 10);
     year[3] = (char)('0' + year_number % 10);
     year[4] = '\0';
-    draw_text(year, 13, 8, 12, INK_RED);
+    const int header_digit_scale = 12;
+    const int header_y = 8;
+    const int header_center = ascii_center_y(header_y, header_digit_scale);
+    const int header_unit_y = header_center - CHINESE_SIZE / 2 + 1;
+    draw_text(year, 13, header_y, header_digit_scale, INK_RED);
+    const int year_unit_x = 13 + ascii_text_width(year, header_digit_scale) + 2;
+    draw_mixed_text("年", year_unit_x, header_unit_y, header_digit_scale, INK_RED);
+
     char month_number[3];
     const int month_value = local_time->tm_mon + 1;
     if (month_value >= 10) {
@@ -380,16 +655,16 @@ esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent)
         month_number[0] = (char)('0' + month_value);
         month_number[1] = '\0';
     }
-    const int year_unit_x = 13 + text_width(year, 12) + 2;
-    draw_chinese_text("年", year_unit_x, 8, 20, INK_RED);
-    const int month_x = year_unit_x + 22;
-    draw_text(month_number, month_x, 8, 12, INK_RED);
-    draw_chinese_text("月", month_x + text_width(month_number, 12) + 2, 8, 20, INK_RED);
+    const int month_x = year_unit_x + CHINESE_SIZE + 2;
+    draw_text(month_number, month_x, header_y, header_digit_scale, INK_RED);
+    draw_mixed_text("月", month_x + ascii_text_width(month_number, header_digit_scale) + 2,
+                    header_unit_y, header_digit_scale, INK_RED);
     draw_battery(battery_percent);
+
     for (int col = 0; col < 7; ++col) {
         const int cell_left = GRID_X + col * GRID_W / 7;
         const int cell_width = GRID_X + (col + 1) * GRID_W / 7 - cell_left;
-        const int width = text_width(weekdays[col], 6);
+        const int width = ascii_text_width(weekdays[col], 6);
         const ink_t ink = col >= 5 ? INK_RED : INK_BLACK;
         draw_text(weekdays[col], cell_left + (cell_width - width) / 2, 38, 6, ink);
     }
@@ -419,23 +694,27 @@ esp_err_t calendar_ui_render(const struct tm *local_time, int battery_percent)
             number[0] = (char)('0' + day);
             number[1] = '\0';
         } else {
-            two_digits(number, day);
+            number[0] = (char)('0' + day / 10);
+            number[1] = (char)('0' + day % 10);
+            number[2] = '\0';
         }
-        const int width = text_width(number, 8);
+        const int scale = 8;
+        const int width = ascii_text_width(number, scale);
         const int cell_left = GRID_X + col * GRID_W / 7;
         const int cell_width = GRID_X + (col + 1) * GRID_W / 7 - cell_left;
         const int cx = cell_left + cell_width / 2;
         if (row >= calendar_rows) continue;
         const int cy = GRID_Y + row * cell_height + cell_height / 2;
+        const int text_y = cy - ASCII_BODY_HEIGHT_UNITS * scale / (2 * SCALE_UNIT);
         if (day == local_time->tm_mday) {
             const int highlight_height = cell_height - 10;
             fill_rect(cx - 16, cy - highlight_height / 2, 32, highlight_height, INK_RED);
-            draw_text(number, cx - width / 2, cy - 5, 8, INK_WHITE);
+            draw_text(number, cx - width / 2, text_y, scale, INK_WHITE);
         } else {
-            draw_text(number, cx - width / 2, cy - 5, 8, INK_BLACK);
+            draw_text(number, cx - width / 2, text_y, scale, INK_BLACK);
         }
     }
 
-    draw_today_almanac(local_time);
+    draw_today_panel(local_time, weather);
     return gdey042z98_display(s_black, s_red);
 }

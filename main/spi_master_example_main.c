@@ -6,6 +6,7 @@
 
 #include "calendar_ui.h"
 #include "gdey042z98.h"
+#include "weather.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -541,8 +542,19 @@ void app_main(void)
     ESP_ERROR_CHECK(gdey042z98_init());
     battery_adc_init();
     s_battery_percent = battery_read_percent();
+
+    /* Fetch the outdoor weather while Wi-Fi is still up; failure only costs
+     * the weather section, never the calendar refresh. */
+    weather_info_t weather = {0};
+    const esp_err_t weather_err = weather_fetch(&weather);
+    if (weather_err != ESP_OK) {
+        ESP_LOGW(TAG, "Weather update failed (%s); drawing the calendar without it",
+                 esp_err_to_name(weather_err));
+    }
+
     ESP_LOGI(TAG, "Time synchronized; refreshing calendar");
-    const esp_err_t render_err = calendar_ui_render(&now_tm, s_battery_percent);
+    const esp_err_t render_err = calendar_ui_render(&now_tm, s_battery_percent,
+                                                    weather_err == ESP_OK ? &weather : NULL);
     if (render_err != ESP_OK) {
         ESP_LOGE(TAG, "Calendar refresh failed: %s", esp_err_to_name(render_err));
         enter_deep_sleep(WIFI_RETRY_SLEEP_MINUTES, "display retry");
