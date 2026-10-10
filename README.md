@@ -40,16 +40,16 @@
 
 | 墨水屏信号 | ESP32-S3 GPIO |
 | --- | ---: |
-| MOSI / SDA | 42 |
-| SCLK / SCL | 41 |
+| SDI / MOSI / SDA | 38 |
+| SCLK / SCL | 39 |
 | CS | 40 |
-| D/C | 39 |
-| RESET | 38 |
-| BUSY | 47 |
+| D/C | 41 |
+| RESET | 42 |
+| BUSY | 1 |
 | 电池 ADC | 7（ADC1_CH6） |
 | 深度休眠唤醒按钮 | 4（按钮另一端接 GND，低电平唤醒） |
 
-MISO 未使用，屏幕需配置为 4 线 SPI（BS1 拉低）。本工程面向 **ESP32-S3 N16R8** 模组（16 MB Flash + 8 MB PSRAM）；该模组的 Octal PSRAM 占用 GPIO33–37，即使当前未启用 PSRAM 也不要拿这几个脚接外设。BUSY 默认 GPIO 为 47，可在 `idf.py menuconfig` 的 `GDEY042Z98 e-paper configuration` 中修改。
+MISO 未使用，屏幕需配置为 4 线 SPI（BS1 拉低）。本工程面向 **ESP32-S3 N16R8** 模组（16 MB Flash + 8 MB PSRAM）；该模组的 Octal PSRAM 占用 GPIO33–37，即使当前未启用 PSRAM 也不要拿这几个脚接外设。BUSY 默认 GPIO 为 1，可在 `idf.py menuconfig` 的 `GDEY042Z98 e-paper configuration` 中修改。
 
 ## Flash 分区
 
@@ -81,7 +81,7 @@ idf.py -p COMx flash monitor
 
 ## Wi-Fi 和时间
 
-设备连接 Wi-Fi 后启动 SNTP 校时；若暂时无法连接，会在限定时间内重试，并在失败后休眠 30 分钟再尝试，避免一直耗电。项目不提供常驻 TCP/HTTP 远程访问接口。
+设备连接 Wi-Fi 后启动 SNTP 校时；**校时失败不会立即休眠，而是保持唤醒继续重试**：默认最多尝试 5 次、每次等待 20 秒、两次之间间隔 3 秒（总计约 2 分钟），任一次成功就继续取天气并刷新。全部失败才进入原有的 30 分钟休眠重试，避免一直耗电。重试次数与间隔由 `main/spi_master_example_main.c` 的 `SNTP_SYNC_ATTEMPTS`、`SNTP_SYNC_TIMEOUT_SECONDS` 和 `SNTP_SYNC_RETRY_DELAY_SECONDS` 控制。项目不提供常驻 TCP/HTTP 远程访问接口。
 
 校时成功后，设备会在仍然联网时向 Open-Meteo 请求一次当前位置的实时天气（`current=temperature_2m,weather_code,wind_speed_10m`），随后才刷新屏幕。天气请求失败只影响右侧天气区，不影响日历；单次请求超时由 `WEATHER_HTTP_TIMEOUT_MS` 控制。
 

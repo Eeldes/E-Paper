@@ -35,6 +35,12 @@
 #define WAKE_BUTTON_LONG_PRESS_MS 3000
 #define WIFI_CONNECT_TIMEOUT_SECONDS 30
 #define SNTP_SYNC_TIMEOUT_SECONDS 20
+/* A failed time sync retries while the device is still awake instead of
+ * dropping straight back into deep sleep.  Total wait is
+ * SNTP_SYNC_ATTEMPTS * (SNTP_SYNC_TIMEOUT_SECONDS + SNTP_SYNC_RETRY_DELAY_SECONDS),
+ * i.e. about two minutes with the defaults below. */
+#define SNTP_SYNC_ATTEMPTS 5
+#define SNTP_SYNC_RETRY_DELAY_SECONDS 3
 #define WIFI_RETRY_SLEEP_MINUTES 30
 #define SETUP_PORTAL_TIMEOUT_MINUTES 5
 
@@ -417,9 +423,23 @@ static int battery_read_percent(void)
     return (cell_mv - BATTERY_EMPTY_MV) * 100 / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
 }
 
+/* Survive deep sleep (but not a real reset) so an unexpected refresh cycle can
+ * be told apart from a reset loop.  Written by enter_deep_sleep(), read back by
+ * log_previous_cycle() on the next wake. */
+static RTC_DATA_ATTR uint32_t s_cycle_count;
+static RTC_DATA_ATTR uint32_t s_last_sleep_seconds;
+static RTC_DATA_ATTR uint32_t s_expected_wake_at;
+
 static void enter_deep_sleep(uint32_t sleep_minutes, const char *reason)
 {
     const uint64_t sleep_duration_us = (uint64_t)sleep_minutes * 60ULL * 1000000ULL;
+
+    /* Remember this cycle so the next wake can report what was asked for versus
+     * how long the device was actually away.  These live in RTC memory, so the
+     * counter only returns to 0 after a real reset. */
+    s_cycle_count++;
+    s_last_sleep_seconds = (uint32_t)(sleep_duration_us / 1000000ULL);
+    s_expected_wake_at = (uint32_t)(time(NULL) + (time_t)s_last_sleep_seconds);
 
     /* EXT0 uses an RTC GPIO and active-low level. Keep the internal pull-up on
      * so the input remains high while the optional button is not pressed. */
@@ -437,8 +457,9 @@ static void enter_deep_sleep(uint32_t sleep_minutes, const char *reason)
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(sleep_duration_us));
     ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(WAKE_BUTTON_GPIO, 0));
 
-    ESP_LOGI(TAG, "Entering deep sleep for %u minutes (%s); active-low wake button on GPIO%d",
-             (unsigned)sleep_minutes, reason, WAKE_BUTTON_GPIO);
+    ESP_LOGI(TAG, "Entering deep sleep for %u minutes / %u s (%s); cycle %u; active-low wake button on GPIO%d",
+             (unsigned)sleep_minutes, (unsigned)s_last_sleep_seconds, reason,
+             (unsigned)s_cycle_count, WAKE_BUTTON_GPIO);
     /* Wi-Fi is not retained in deep sleep; stop it cleanly before sleeping. */
     if (s_wifi_started) ESP_ERROR_CHECK(esp_wifi_stop());
     esp_deep_sleep_start();
@@ -451,11 +472,84 @@ static bool get_local_time(struct tm *local_time)
     return localtime_r(&now, local_time) != NULL;
 }
 
+/* Wait for the network time, retrying while the device is still awake.  Each
+ * esp_netif_sntp_sync_wait() call takes from the sync semaphore, so a timeout
+ * simply means the next call waits for the following sync event.  Returns true
+ * as soon as the clock is usable. */
+static bool sync_network_time(void)
+{
+    for (int attempt = 1; attempt <= SNTP_SYNC_ATTEMPTS; ++attempt) {
+        const esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(SNTP_SYNC_TIMEOUT_SECONDS * 1000));
+        struct tm now_tm;
+        if (err == ESP_OK && get_local_time(&now_tm)) {
+            if (attempt > 1) ESP_LOGI(TAG, "Network time synchronized on attempt %d", attempt);
+            return true;
+        }
+        if (attempt < SNTP_SYNC_ATTEMPTS) {
+            ESP_LOGW(TAG, "Time sync attempt %d/%d failed (%s); retrying in %d s",
+                     attempt, SNTP_SYNC_ATTEMPTS, esp_err_to_name(err), SNTP_SYNC_RETRY_DELAY_SECONDS);
+            vTaskDelay(pdMS_TO_TICKS(SNTP_SYNC_RETRY_DELAY_SECONDS * 1000));
+        } else {
+            ESP_LOGW(TAG, "Time sync attempt %d/%d failed (%s); no attempts left",
+                     attempt, SNTP_SYNC_ATTEMPTS, esp_err_to_name(err));
+        }
+    }
+    return false;
+}
+
+static void log_reset_reason(void)
+{
+    const esp_reset_reason_t reason = esp_reset_reason();
+    const char *text = "unknown";
+    switch (reason) {
+    case ESP_RST_POWERON: text = "power-on"; break;
+    case ESP_RST_EXT: text = "external pin"; break;
+    case ESP_RST_SW: text = "software"; break;
+    case ESP_RST_PANIC: text = "panic/exception"; break;
+    case ESP_RST_INT_WDT: text = "interrupt watchdog"; break;
+    case ESP_RST_TASK_WDT: text = "task watchdog"; break;
+    case ESP_RST_WDT: text = "other watchdog"; break;
+    case ESP_RST_DEEPSLEEP: text = "deep-sleep wake"; break;
+    case ESP_RST_BROWNOUT: text = "brownout"; break;
+    case ESP_RST_SDIO: text = "sdio"; break;
+    default: break;
+    }
+    ESP_LOGI(TAG, "Reset reason: %s", text);
+}
+
+/* Report what the previous cycle actually did, in wall-clock terms.  The RTC
+ * keeps running through deep sleep, so comparing the current time against the
+ * expected wake-up time gives the real sleep duration even if the clock has
+ * drifted. */
+static void log_previous_cycle(void)
+{
+    const time_t now = time(NULL);
+    if (s_last_sleep_seconds == 0) {
+        ESP_LOGW(TAG, "No sleep accounting found; RTC memory was cleared by a reset");
+        return;
+    }
+    const long slept = (long)now - (long)s_expected_wake_at + (long)s_last_sleep_seconds;
+    const esp_reset_reason_t reason = esp_reset_reason();
+    if (now > 1704067200 && reason == ESP_RST_DEEPSLEEP) {
+        ESP_LOGW(TAG, "Cycle %u: asked to sleep %u s, actually slept %ld s",
+                 (unsigned)s_cycle_count, (unsigned)s_last_sleep_seconds, slept);
+    } else {
+        ESP_LOGW(TAG, "Cycle %u: asked to sleep %u s, but woke via a reset (%s)",
+                 (unsigned)s_cycle_count, (unsigned)s_last_sleep_seconds,
+                 reason == ESP_RST_BROWNOUT ? "brownout" :
+                 reason == ESP_RST_PANIC ? "panic" :
+                 reason == ESP_RST_INT_WDT ? "interrupt watchdog" :
+                 reason == ESP_RST_TASK_WDT ? "task watchdog" :
+                 reason == ESP_RST_EXT ? "external pin" : "other");
+    }
+    s_last_sleep_seconds = 0;
+}
+
 void app_main(void)
 {
     const esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     if (wake_cause == ESP_SLEEP_WAKEUP_TIMER) {
-        ESP_LOGI(TAG, "Woke from 12-hour timer; refreshing network time");
+        ESP_LOGI(TAG, "Woke from timer; refreshing network time");
     } else if (wake_cause == ESP_SLEEP_WAKEUP_EXT0) {
         ESP_LOGI(TAG, "Woke from button on GPIO%d; refreshing network time", WAKE_BUTTON_GPIO);
     } else {
@@ -464,6 +558,10 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     setenv("TZ", "CST-8", 1);
     tzset();
+    log_reset_reason();
+    if (wake_cause == ESP_SLEEP_WAKEUP_TIMER || wake_cause == ESP_SLEEP_WAKEUP_EXT0) {
+        log_previous_cycle();
+    }
     s_wifi_events = xEventGroupCreate();
     ESP_ERROR_CHECK(s_wifi_events ? ESP_OK : ESP_ERR_NO_MEM);
 
@@ -515,10 +613,10 @@ void app_main(void)
     }
 
     sntp_start();
-    const esp_err_t sync_err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(SNTP_SYNC_TIMEOUT_SECONDS * 1000));
     struct tm now_tm;
-    if (sync_err != ESP_OK || !get_local_time(&now_tm)) {
-        ESP_LOGW(TAG, "Network time sync failed (%s); will retry after sleep", esp_err_to_name(sync_err));
+    if (!sync_network_time() || !get_local_time(&now_tm)) {
+        ESP_LOGW(TAG, "Network time unavailable after %d attempts; will retry after sleep",
+                 SNTP_SYNC_ATTEMPTS);
         if (has_pending) {
             nvs_clear_pending_credentials();
             ESP_LOGW(TAG, "New network did not provide time sync; returning to setup portal");

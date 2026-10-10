@@ -14,17 +14,18 @@
 #include "freertos/task.h"
 
 #ifndef CONFIG_EPD_BUSY_GPIO
-#define CONFIG_EPD_BUSY_GPIO 47
+#define CONFIG_EPD_BUSY_GPIO 1
 #endif
 
 /* Keep the project's confirmed ESP32-S3 wiring. The panel is operated in
- * 4-wire SPI mode (BS1 must be tied low on the panel side). */
+ * 4-wire SPI mode (BS1 must be tied low on the panel side).
+ * SDI is the panel's data-in line and is driven by the ESP32-S3 MOSI output. */
 #define EPD_HOST       SPI2_HOST
-#define EPD_PIN_MOSI   42
-#define EPD_PIN_SCLK   41
+#define EPD_PIN_SDI    38
+#define EPD_PIN_SCLK   39
 #define EPD_PIN_CS     40
-#define EPD_PIN_DC     39
-#define EPD_PIN_RESET  38
+#define EPD_PIN_DC     41
+#define EPD_PIN_RESET  42
 #define EPD_PIN_BUSY   CONFIG_EPD_BUSY_GPIO
 
 #define EPD_WIDTH             400
@@ -191,7 +192,7 @@ esp_err_t gdey042z98_init(void)
 #endif
 
     spi_bus_config_t bus_config = {
-        .mosi_io_num = EPD_PIN_MOSI,
+        .mosi_io_num = EPD_PIN_SDI,
         .miso_io_num = -1,
         .sclk_io_num = EPD_PIN_SCLK,
         .quadwp_io_num = -1,
